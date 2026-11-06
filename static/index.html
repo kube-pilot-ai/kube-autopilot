@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kube Autopilot · Chat</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #172b3a; background: #f3f6f8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 960px; margin: auto; min-height: 100dvh; display: flex; flex-direction: column; padding: 32px 24px 20px; }
+    header { border-bottom: 1px solid #d8e1e7; padding-bottom: 20px; }
+    h1 { margin: 0 0 8px; font-size: 26px; letter-spacing: -.7px; }
+    p { margin: 0; color: #526675; line-height: 1.6; }
+    .badge { display: inline-block; font-size: 12px; color: #246457; background: #e0efe9; border-radius: 20px; padding: 4px 10px; margin-bottom: 14px; }
+    #messages { flex: 1; padding: 24px 0; }
+    .message { border: 1px solid #dbe4e9; background: white; border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+    .message.user { background: #e9f0f9; margin-left: 40px; }
+    .message.error { border-color: #c26b6b; }
+    .label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; margin-bottom: 10px; color: #536c7e; }
+    .content { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; font-size: 14px; }
+    #status { min-height: 28px; font-size: 14px; color: #4b6477; }
+    form { position: sticky; bottom: 0; background: #f3f6f8; padding-top: 12px; }
+    label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+    .composer { display: flex; gap: 12px; }
+    textarea { flex: 1; min-width: 0; resize: vertical; border: 1px solid #b7c8d4; border-radius: 10px; padding: 14px; font: inherit; min-height: 80px; background: white; }
+    button { border: 0; border-radius: 10px; padding: 12px 24px; background: #235fb6; color: white; font: inherit; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    :focus-visible { outline: 3px solid #78a9ee; outline-offset: 3px; }
+    .hint { font-size: 12px; padding: 10px 0; }
+    .history-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; align-items: center; }
+    .history-bar label { margin: 0; }
+    select { flex: 1; min-width: 120px; max-width: 500px; padding: 10px; border: 1px solid #b7c8d4; border-radius: 8px; background: white; font: inherit; }
+    .secondary { background: #e0e8ee; color: #172b3a; font-size: 13px; padding: 10px 14px; }
+    @media (max-width: 600px) { main { padding: 20px 14px 10px; } .message.user { margin-left: 16px; } button { padding: 12px 16px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="badge">Read-only Kubernetes assistant</span>
+    <h1>Kube Autopilot</h1>
+    <p>Ask about namespaces, nodes, pods, deployments, services, logs and events.</p>
+    <div class="history-bar">
+      <label for="conversations">Saved chats</label>
+      <select id="conversations" aria-label="Saved chats"></select>
+      <button id="new-chat" class="secondary" type="button">New chat</button>
+      <button id="resume" class="secondary" type="button" hidden>Resume last request</button>
+    </div>
+  </header>
+  <section id="messages" role="log" aria-label="Chat messages" aria-live="polite">
+    <div class="message"><div class="label">Assistant</div><div class="content">What would you like to inspect?
+Try “List all namespaces” or “List pods in namespace default”.</div></div>
+  </section>
+  <div id="status" role="status" aria-live="polite"></div>
+  <form id="chat-form">
+    <label for="question">Your question</label>
+    <div class="composer">
+      <textarea id="question" placeholder="List all namespaces" maxlength="10000" required></textarea>
+      <button id="send" type="submit">Send</button>
+    </div>
+    <p class="hint">Chats are saved. Follow-up questions use this conversation’s history. Enter to send · Shift+Enter for a new line.</p>
+  </form>
+</main>
+<script>
+  const form = document.getElementById('chat-form');
+  const question = document.getElementById('question');
+  const send = document.getElementById('send');
+  const status = document.getElementById('status');
+  const messages = document.getElementById('messages');
+  const conversations = document.getElementById('conversations');
+  const newChat = document.getElementById('new-chat');
+  const resume = document.getElementById('resume');
+  let conversationId = null;
+  let busy = false;
+  let canResume = false;
+  async function api(url, options = {}) {
+    const response = await fetch(url, options);
+    const data = await response.json();
+    if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Unable to process this request.');
+    return data;
+  }
+  function setBusy(value) {
+    busy = value;
+    send.disabled = value || !conversationId || canResume;
+    question.disabled = value || !conversationId || canResume;
+    conversations.disabled = value;
+    newChat.disabled = value;
+    resume.disabled = value;
+  }
+  async function refreshConversations() {
+    const chats = await api('/conversations');
+    conversations.replaceChildren();
+    for (const chat of chats) {
+      const option = document.createElement('option');
+      option.value = chat.id;
+      option.textContent = chat.title;
+      conversations.append(option);
+    }
+    if (conversationId) conversations.value = conversationId;
+    return chats;
+  }
+  async function loadConversation(id) {
+    const chat = await api('/conversations/' + encodeURIComponent(id));
+    conversationId = chat.id;
+    localStorage.setItem('kube-autopilot-conversation', conversationId);
+    conversations.value = conversationId;
+    canResume = chat.can_resume;
+    resume.hidden = !canResume;
+    messages.replaceChildren();
+    for (const message of chat.messages) {
+      appendMessage(message.role === 'user' ? 'user' : 'assistant', message.content, message.role === 'error');
+    }
+    if (!chat.messages.length) appendMessage('assistant', 'What would you like to inspect?');
+  }
+  async function createChat() {
+    const chat = await api('/conversations', {method: 'POST'});
+    conversationId = chat.id;
+    await refreshConversations();
+    await loadConversation(chat.id);
+  }
+  async function navigate(action) {
+    if (busy) return;
+    setBusy(true);
+    status.textContent = 'Loading chat…';
+    try { await action(); status.textContent = ''; }
+    catch (error) { status.textContent = error.message; }
+    finally { setBusy(false); }
+  }
+  newChat.addEventListener('click', () => navigate(createChat));
+  conversations.addEventListener('change', () => navigate(() => loadConversation(conversations.value)));
+  resume.addEventListener('click', () => navigate(async () => {
+    status.textContent = 'Resuming request…';
+    try { await api('/conversations/' + conversationId + '/resume', {method: 'POST'}); }
+    finally { await refreshConversations(); await loadConversation(conversationId); }
+  }));
+  function appendMessage(role, content, error = false) {
+    const item = document.createElement('div');
+    item.className = 'message ' + role + (error ? ' error' : '');
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.textContent = role === 'user' ? 'You' : 'Assistant';
+    const text = document.createElement('div');
+    text.className = 'content';
+    text.textContent = content;
+    item.append(label, text);
+    messages.append(item);
+    item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const message = question.value.trim();
+    if (!message || busy || !conversationId || canResume) return;
+    setBusy(true);
+    appendMessage('user', message);
+    question.value = '';
+    status.textContent = 'Working on your question…';
+    try {
+      await api('/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message, conversation_id: conversationId })
+      });
+      await refreshConversations();
+      await loadConversation(conversationId);
+    } catch (error) {
+      try { await refreshConversations(); await loadConversation(conversationId); }
+      catch (_) { /* Keep the currently displayed conversation on network failure. */ }
+      appendMessage('assistant', error.message || 'Unable to connect to the server.', true);
+    } finally {
+      setBusy(false);
+      status.textContent = '';
+      question.focus();
+    }
+  });
+  question.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      if (!busy) form.requestSubmit();
+    }
+  });
+  navigate(async () => {
+    const chats = await refreshConversations();
+    const saved = localStorage.getItem('kube-autopilot-conversation');
+    const selected = chats.find(chat => chat.id === saved) || chats[0];
+    if (selected) await loadConversation(selected.id);
+    else await createChat();
+  });
+</script>
+</body>
+</html>
