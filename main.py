@@ -9,6 +9,7 @@ from langgraph.errors import GraphRecursionError
 
 from graph import build_graph
 from mcp_client import load_mcp_tools
+from rag_client import retrieve_context
 
 
 def main():
@@ -23,9 +24,9 @@ def main():
             content="list out all the the namespaces"
         ),
     ]
-    graph = build_graph(llm, tools)
+    graph = build_graph(llm, tools, retriever=retrieve_context)
     try:
-        result = graph.invoke({"messages": messages}, config={"recursion_limit": 21})
+        result = graph.invoke({"messages": messages}, config={"recursion_limit": 40})
     except GraphRecursionError:
         raise SystemExit("Stopped at the graph step limit. Try a more specific instruction.")
     print(result["messages"][-1].text)
