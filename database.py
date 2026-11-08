@@ -29,6 +29,17 @@ def open_database(url):
             """)
             conn.execute("""CREATE INDEX IF NOT EXISTS chat_messages_conversation_idx
                             ON chat_messages(conversation_id, id)""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_activity (
+                    id BIGSERIAL PRIMARY KEY,
+                    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    stage TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            conn.execute("""CREATE INDEX IF NOT EXISTS chat_activity_conversation_idx
+                            ON chat_activity(conversation_id, id)""")
         return pool
     except Exception:
         pool.close()

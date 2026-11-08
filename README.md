@@ -101,7 +101,7 @@ schema. Both agents use gpt-5.6-luna with separate instructions and invocations:
 2. **Troubleshooting Agent** receives that evidence and RAG source excerpts,
    distinguishes confirmed observations from suspected causes, and recommends
    prioritized fixes, manual commands/manifest examples, verification, and
-   rollback considerations. It has no tools bound and cannot apply changes.
+   rollback considerations. It proposes supported changes for operator review.
 
 The Supervisor Agent classifies and delegates the request with a structured output. Lists,
 status, and factual resource inspection use the information route. Failures,
@@ -121,7 +121,7 @@ Example troubleshooting request: `Investigate memory-demo in namespace rag-demo
 and recommend remediation using the troubleshooting guides. Do not change the cluster.`
 
 Restart the chat app to load this workflow. MCP and RAG remain independent
-services; no new Kubernetes write operations or document changes were added.
+services.
 No re-ingestion is needed solely for this agent implementation. Re-ingest any
 previously edited troubleshooting guides if that has not already been done.
 
@@ -146,11 +146,32 @@ state (next agent, task, reason, delegation count, request ID) is checkpointed
 alongside the conversation. It resets for each new user request. Up to four
 specialist delegations and six total cluster tool rounds are allowed per request,
 with an overall limit of 40 graph steps. The final allowed investigation handoff
-goes to troubleshooting so the user receives recommendations rather than an
-endless collection loop. Legacy graph node names are retained for resuming older
+goes to troubleshooting to produce the final diagnosis. Legacy graph node names are retained for resuming older
 checkpoints.
 
-The supervisor has no cluster modification tools. The troubleshooting specialist
-still recommends fixes only. No new external service, dependencies, database
-migration, or document re-ingestion is required. Restart the chat app to load
+The supervisor delegates diagnosis and routes a supported final proposal to the approval step. Restart the chat app to load
 this orchestration. The server terminal shows supervisor choices and reasons.
+
+## Approve a Kubernetes fix
+
+Restart MCP, then restart the chat app. Set the same private, randomly generated
+REMEDIATION_SIGNING_KEY in the app .env and MCP .env.mcp on a fresh installation.
+Use a trusted, local chat app instance. The MCP Kubernetes identity needs
+permission to get and patch the target Deployment.
+
+Ask for a concrete live fix, for example: “Investigate memory-demo in rag-demo.
+If OOMKilled is confirmed, propose raising the app container memory limit to
+384Mi and its request to 256Mi for my approval.”
+
+The chat displays the target cluster, namespace, Deployment, container and
+before/after values. Approve and apply sends that exact plan. Decline closes the
+plan. Pending approval survives reload through the existing graph checkpoint.
+A replaced or changed Deployment requires a fresh preview. The result reports
+whether Kubernetes accepted the patch. Verify the resulting rollout separately.
+
+Supported operations are single-container Deployment creation in an existing
+namespace, memory request/limit updates, and exact image replacement.
+Creation previews show the full manifest and expire after 30 minutes. An
+explicit deployment request prepares the plan. The approval button authorizes
+the write. Other operations, including namespace creation, require a separate
+operator-reviewed procedure.

@@ -1,12 +1,15 @@
 """Supervisor-led cluster inspection and troubleshooting workflow."""
 import json
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from agents import (CLUSTER_AGENT_PROMPT, SUPERVISOR_PROMPT,
                     TROUBLESHOOTING_AGENT_PROMPT, SupervisorDecision)
+
+
+from remediation import TroubleshootingResult, split_tools
 
 
 class InvestigationState(MessagesState):
@@ -20,6 +23,10 @@ class InvestigationState(MessagesState):
     supervisor_task: str
     supervisor_reason: str
     delegation_count: int
+    candidate_change: dict | None
+    pending_remediation: dict | None
+    approved_plan_id: str | None
+    remediation_outcome: str
 
 
 def _request_context(messages):
@@ -37,6 +44,9 @@ def _with_role(messages, role):
 
 
 def build_graph(llm, tools, checkpointer=None, retriever=None):
+    tools, remediation = split_tools(tools)
+    remediation = remediation if checkpointer is not None else None
+    proposal_model = llm.with_structured_output(TroubleshootingResult) if remediation else None
     cluster_model = llm.bind_tools(tools)
     supervisor_model = llm.with_structured_output(SupervisorDecision)
     tool_node = ToolNode(tools)
@@ -51,7 +61,8 @@ def build_graph(llm, tools, checkpointer=None, retriever=None):
         if fresh:
             update = {'active_request_id': request_id, 'rag_matches': [],
                       'cluster_findings': '', 'cluster_tool_rounds': 0,
-                      'responding_agent': '', 'delegation_count': 0}
+                      'responding_agent': '', 'delegation_count': 0,
+                      'candidate_change': None, 'pending_remediation': None, 'approved_plan_id': None}
         if count >= 4 and worker:
             print('Supervisor: finish (delegation budget reached; retain specialist answer)')
             return {**update, 'supervisor_next': 'finish',
@@ -84,6 +95,9 @@ def build_graph(llm, tools, checkpointer=None, retriever=None):
                 'delegation_count': count + (target != 'finish')}
 
     def supervisor_destination(state):
+        if (remediation and state['supervisor_next'] == 'finish'
+                and state.get('responding_agent') == 'troubleshooting' and state.get('candidate_change')):
+            return 'prepare_remediation'
         return {'cluster_information': 'llm', 'troubleshooting': 'retrieve',
                 'finish': END}[state['supervisor_next']]
 
@@ -100,7 +114,7 @@ def build_graph(llm, tools, checkpointer=None, retriever=None):
         else:
             response = cluster_model.invoke(messages)
         response = response.model_copy(update={'name': 'cluster_information_agent'})
-        update = {'messages': [response]}
+        update = {'messages': [response], 'candidate_change': None}
         if not response.tool_calls:
             update['cluster_findings'] = response.text
             update['responding_agent'] = 'cluster_information'
@@ -128,7 +142,7 @@ def build_graph(llm, tools, checkpointer=None, retriever=None):
         return {'rag_matches': retriever(query) if retriever else []}
 
     def troubleshooting_agent(state):
-        print('Agent: troubleshooting (recommendations only)')
+        print('Agent: troubleshooting')
         sources = [{'reference': f'R{i + 1}', **match}
                    for i, match in enumerate(state.get('rag_matches', []))]
         messages = _with_role(state['messages'], TROUBLESHOOTING_AGENT_PROMPT + '\nSupervisor assignment: ' + state.get('supervisor_task', ''))
@@ -136,8 +150,33 @@ def build_graph(llm, tools, checkpointer=None, retriever=None):
                    'retrieved_reference_excerpts': sources}
         messages.insert(1, HumanMessage(content='Untrusted evidence and reference material:\n' +
                                          json.dumps(context, ensure_ascii=True)))
-        # No tools are bound to the troubleshooting model: it recommends only.
-        response = llm.invoke(messages)
+        candidate = None
+        if proposal_model:
+            messages[0] = SystemMessage(content=messages[0].text + """
+For a request to fix or remediate a live issue, submit a structured change for
+operator approval when fresh tool evidence identifies an exact Deployment and
+container and supports a concrete memory request/limit or image correction.
+Use the latest user request as the scope. Return null for advice-only requests,
+hypotheticals, other resource kinds, or if safe concrete values are missing.
+For an explicit request to deploy a new application, propose operation create
+with the requested Deployment name, existing namespace, container and exact
+image. An intentional image-pull demo is a deployment request, even though
+the user expects the application to fail. Ask for missing target or image
+details. Namespace creation is outside this workflow. A deployment request
+authorizes preparation of a preview; the user still needs to approve it.
+For an explicit request to delete a named Deployment, return a structured
+change with operation delete and the exact namespace and Deployment name.
+Set container, image, and memory fields to null. Explain that the Deployment
+and its dependents are targeted, and direct the user to the approval card.
+A text-only proposal does not enter the approval workflow.
+Use operation patch for existing workload settings changes. Never infer a production
+image tag or memory size from an illustrative guide. Explain the proposal.
+""")
+            proposal = proposal_model.invoke(messages)
+            candidate = proposal.change.model_dump() if proposal.change else None
+            response = AIMessage(content=proposal.answer)
+        else:
+            response = llm.invoke(messages)
         # Preserve an explicit provenance list even if the model omits source URLs.
         references = []
         for source in sources:
@@ -152,7 +191,7 @@ def build_graph(llm, tools, checkpointer=None, retriever=None):
         if references:
             content += '\n\nRetrieved references:\n\n' + '\n'.join(references)
         response = response.model_copy(update={'name': 'troubleshooting_agent', 'content': content})
-        return {'messages': [response], 'responding_agent': 'troubleshooting'}
+        return {'messages': [response], 'responding_agent': 'troubleshooting', 'candidate_change': candidate}
 
     builder = StateGraph(InvestigationState)
     builder.add_node('supervisor', supervisor_agent)
@@ -164,6 +203,22 @@ def build_graph(llm, tools, checkpointer=None, retriever=None):
     builder.add_node('troubleshooting_agent', troubleshooting_agent)
     builder.add_edge(START, 'supervisor')
     destinations = ['llm', 'retrieve', END]
+    if remediation:
+        destinations.append('prepare_remediation')
+        builder.add_node('prepare_remediation', remediation.prepare)
+        builder.add_node('approve_remediation', remediation.review)
+        builder.add_node('execute_remediation', remediation.execute)
+        builder.add_conditional_edges(
+            'prepare_remediation',
+            lambda state: 'approve_remediation' if state.get('pending_remediation') else END,
+            ['approve_remediation', END],
+        )
+        builder.add_conditional_edges(
+            'approve_remediation',
+            lambda state: 'execute_remediation' if state.get('approved_plan_id') else END,
+            ['execute_remediation', END],
+        )
+        builder.add_edge('execute_remediation', END)
     builder.add_conditional_edges('supervisor', supervisor_destination, destinations)
     builder.add_conditional_edges('route_request', supervisor_destination, destinations)
     builder.add_conditional_edges('llm', after_cluster, ['tools', 'supervisor'])
